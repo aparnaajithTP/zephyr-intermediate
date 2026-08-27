@@ -1,59 +1,66 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
-LOG_MODULE_REGISTER(demo, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(homework, LOG_LEVEL_DBG);
 
 #define STACK_SIZE 1024
-#define THREAD_PRIORITY 5
-#define NUM_ITERATIONS 1000
+#define SENSOR_MS 100
+#define EVENT_COUNT 10
 
-volatile int shared_counter = 0;
+static int total_events;
+static int total_processed;
 
-K_MUTEX_DEFINE(counter_mutex); //defining mutex
-
-void thread_a_fn(void *p1, void *p2, void *p3)
+/* Work handler */
+static void sensor_handler(struct k_work *work)
 {
-    for (int i = 0; i < NUM_ITERATIONS; i++) {
-        k_mutex_lock(&counter_mutex, K_FOREVER);
+    ARG_UNUSED(work);
 
-        int temp = shared_counter;
-        k_yield();
-        shared_counter = temp + 1;
+    total_processed++;
 
-        k_mutex_unlock(&counter_mutex);
-    }
-
-    LOG_INF("Thread A finished");
+    LOG_INF("[HANDLER] processed event %d  tick=%u",
+            total_processed, k_uptime_get_32());
 }
 
-void thread_b_fn(void *p1, void *p2, void *p3)
+K_WORK_DEFINE(sensor_work, sensor_handler);
+
+/* Sensor simulation thread */
+static void sensor_sim_fn(void *p1, void *p2, void *p3)
 {
-    for (int i = 0; i < NUM_ITERATIONS; i++) {
-        k_mutex_lock(&counter_mutex, K_FOREVER);
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
 
-        int temp = shared_counter;
-        k_yield();
-        shared_counter = temp + 1;
+    for (int i = 0; i < EVENT_COUNT; i++) {
+        k_msleep(SENSOR_MS);
 
-        k_mutex_unlock(&counter_mutex);
+        total_events++;
+
+        LOG_INF("[SENSOR] event %d  tick=%u",
+                i, k_uptime_get_32());
+
+        int ret = k_work_submit(&sensor_work);
+
+        if (ret < 0) {
+            LOG_ERR("submit failed: %d", ret);
+        }
     }
 
-    LOG_INF("Thread B finished");
+    LOG_INF("[SENSOR] all events produced");
 }
 
-K_THREAD_DEFINE(thread_a, STACK_SIZE, thread_a_fn,
-                NULL, NULL, NULL, THREAD_PRIORITY, 0, 0);
-
-K_THREAD_DEFINE(thread_b, STACK_SIZE, thread_b_fn,
-                NULL, NULL, NULL, THREAD_PRIORITY, 0, 0);
+K_THREAD_DEFINE(sensor_thread, STACK_SIZE, sensor_sim_fn,
+                NULL, NULL, NULL, 5, 0, 0);
 
 int main(void)
 {
-    k_thread_join(thread_a, K_FOREVER);
-    k_thread_join(thread_b, K_FOREVER);
+    LOG_INF("=== L3 Homework: Polling to Workqueue ===");
+    LOG_INF("Workqueue version: sensor fires every %dms", SENSOR_MS);
 
-    LOG_INF("Final counter: %d", shared_counter);
-    LOG_INF("Expected counter: %d", NUM_ITERATIONS * 2);
+    /* Wait long enough for all events and work to complete */
+    k_msleep((EVENT_COUNT + 2) * SENSOR_MS);
+
+    LOG_INF("[SUMMARY] events=%d processed=%d",
+            total_events, total_processed);
 
     return 0;
 }
