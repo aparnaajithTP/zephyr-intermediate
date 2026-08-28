@@ -1,66 +1,147 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/zbus/zbus.h>
 
-LOG_MODULE_REGISTER(homework, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(assignment4, LOG_LEVEL_DBG);
 
 #define STACK_SIZE 1024
-#define BURST_COUNT 5
-#define BURST_INTERVAL_MS 5
-#define DEBOUNCE_MS 30
+#define SENSOR_PERIOD_MS 100
+#define SENSOR_COUNT 10
 
-static int total_events;
-static int total_processed;
+struct sensor_data {
+    uint32_t timestamp_ms;
+    int32_t value;
+    uint8_t seq;
+};
 
-static void sensor_handler(struct k_work *work)
+/* Forward declaration for the listener callback */
+static void display_listener_cb(const struct zbus_channel *chan);
+
+/* Listener: fast display update */
+ZBUS_LISTENER_DEFINE(display_listener, display_listener_cb);
+
+/* Subscriber: slower logging */
+ZBUS_MSG_SUBSCRIBER_DEFINE(logger_subscriber);
+
+/* One zbus channel */
+ZBUS_CHAN_DEFINE(sensor_chan, struct sensor_data,
+                 NULL, NULL,
+                 ZBUS_OBSERVERS(display_listener, logger_subscriber),
+                 ZBUS_MSG_INIT(.timestamp_ms = 0,
+                               .value = 0,
+                               .seq = 0));
+
+/*
+ * Fast listener.
+ *
+ * This runs immediately when the sensor publishes.
+ */
+static void display_listener_cb(const struct zbus_channel *chan)
 {
-    ARG_UNUSED(work);
+    const struct sensor_data *msg =
+        (const struct sensor_data *)zbus_chan_const_msg(chan);
 
-    total_processed++;
-
-    LOG_INF("[HANDLER] processed event %d tick=%u",
-            total_processed, k_uptime_get_32());
+    LOG_INF("[DISPLAY] seq=%u value=%d tick=%u",
+            msg->seq,
+            msg->value,
+            k_uptime_get_32());
 }
 
-K_WORK_DELAYABLE_DEFINE(debounce_work, sensor_handler);
-
-static void sensor_sim_fn(void *p1, void *p2, void *p3)
+/*
+ * Sensor publisher.
+ *
+ * Publishes one sample every 100 ms.
+ */
+static void sensor_thread_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1);
     ARG_UNUSED(p2);
     ARG_UNUSED(p3);
 
-    for (int i = 0; i < BURST_COUNT; i++) {
-        k_msleep(BURST_INTERVAL_MS);
+    k_thread_name_set(k_current_get(), "sensor");
 
-        total_events++;
+    for (int i = 0; i < SENSOR_COUNT; i++) {
+        struct sensor_data data = {
+            .timestamp_ms = k_uptime_get_32(),
+            .value = 100 + i,
+            .seq = (uint8_t)i,
+        };
 
-        LOG_INF("[SENSOR] burst event %d tick=%u",
-                i, k_uptime_get_32());
+        LOG_INF("[SENSOR] publish seq=%u value=%d",
+                data.seq,
+                data.value);
 
-        int ret = k_work_reschedule(&debounce_work,
-                                    K_MSEC(DEBOUNCE_MS));
+        int ret = zbus_chan_pub(&sensor_chan, &data, K_MSEC(100));
 
-        if (ret < 0) {
-            LOG_ERR("reschedule failed: %d", ret);
+        if (ret != 0) {
+            LOG_ERR("[SENSOR] publish failed: %d", ret);
         }
+
+        k_msleep(SENSOR_PERIOD_MS);
     }
 
-    LOG_INF("[SENSOR] burst complete");
+    LOG_INF("[SENSOR] done");
 }
 
-K_THREAD_DEFINE(sensor_thread, STACK_SIZE, sensor_sim_fn,
-                NULL, NULL, NULL, 5, 0, 0);
+/*
+ * Slow subscriber.
+ *
+ * Unlike the listener, this runs in its own thread and
+ * deliberately processes messages slowly.
+ */
+static void logger_thread_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
+
+    k_thread_name_set(k_current_get(), "logger");
+
+    const struct zbus_channel *chan;
+    int received = 0;
+
+    while (received < SENSOR_COUNT) {
+        struct sensor_data msg;
+
+        int ret = zbus_sub_wait_msg(&logger_subscriber,
+                                    &chan,
+                                    &msg,
+                                    K_MSEC(1000));
+
+        if (ret != 0) {
+            LOG_WRN("[LOGGER] timeout: %d", ret);
+            break;
+        }
+
+        received++;
+
+        LOG_INF("[LOGGER] seq=%u value=%d tick=%u",
+                msg.seq,
+                msg.value,
+                k_uptime_get_32());
+
+        /* Simulate slower logging */
+        k_msleep(250);
+    }
+
+    LOG_INF("[LOGGER] done received=%d", received);
+}
+
+K_THREAD_DEFINE(sensor_thread, STACK_SIZE,
+                sensor_thread_fn,
+                NULL, NULL, NULL,
+                5, 0, 0);
+
+K_THREAD_DEFINE(logger_thread, STACK_SIZE,
+                logger_thread_fn,
+                NULL, NULL, NULL,
+                6, 0, 0);
 
 int main(void)
 {
-    LOG_INF("=== L3 Homework: Workqueue Debounce Bonus ===");
-    LOG_INF("5 events within 20ms, debounce delay = 30ms");
-
-    /* Wait for burst and delayed handler */
-    k_msleep(200);
-
-    LOG_INF("[SUMMARY] events=%d handler_calls=%d",
-            total_events, total_processed);
+    LOG_INF("=== L4 Assignment: Zbus ===");
+    LOG_INF("Sensor publishes every %d ms", SENSOR_PERIOD_MS);
+    LOG_INF("One fast listener + one slow subscriber");
 
     return 0;
 }
