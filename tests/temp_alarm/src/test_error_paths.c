@@ -69,7 +69,7 @@ ZTEST(temp_alarm_sensor_errors, test_fail_then_recover)
         struct temp_alarm_status status;
         int fetch_results[] = { -EIO, 0 };
         sensor_fake_set_temperature(20);
-        SET_RETURN_SEQ(fake_sensor_sample_fetch, return_val, fetch_results, ARRAY_SIZE(fetch_results));
+        SET_RETURN_SEQ(fake_sensor_sample_fetch, fetch_results, ARRAY_SIZE(fetch_results));
         zassert_equal(temp_alarm_check(), -EIO);
         zassert_ok(temp_alarm_check());
         zassert_ok(temp_alarm_get_status(&status));

@@ -25,15 +25,19 @@ static int sim_temperature;
  * the whole degrees; val2 (millionths) is not used, so it is set to 0.
  */
 static int custom_sensor_channel_get(const struct device *dev, enum sensor_channel chan,
-				     struct sensor_value *val)
+                                     struct sensor_value *val)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(chan);
+        ARG_UNUSED(dev);
+        ARG_UNUSED(chan);
 
-	val->val1 = sim_temperature;
-	val->val2 = 0;
+        if (fake_sensor_channel_get_fake.return_val != 0) {
+                return fake_sensor_channel_get_fake.return_val;
+        }
 
-	return 0;
+        val->val1 = sim_temperature;
+        val->val2 = 0;
+
+        return 0;
 }
 
 /* ---- Fake sensor device -------------------------------------------------- */
@@ -41,7 +45,7 @@ static int custom_sensor_channel_get(const struct device *dev, enum sensor_chann
 /* The API table temp_alarm.c calls through. */
 static const struct sensor_driver_api fake_sensor_api = {
 	/* TODO(l8-task0): replace NULL with fake_sensor_sample_fetch. */
-	.sample_fetch = NULL,
+	.sample_fetch = fake_sensor_sample_fetch,
 	.channel_get = fake_sensor_channel_get,
 };
 
@@ -67,11 +71,12 @@ void sensor_fake_set_temperature(int temp_celsius)
 void sensor_fake_init(void)
 {
 	fake_sensor_channel_get_fake.custom_fake = custom_sensor_channel_get;
+        /* Allow error injection through return_val in tests. */
 }
 
 void sensor_fake_reset(void)
 {
-	/* TODO(l8-task0): reset fake_sensor_sample_fetch here too. */
+        RESET_FAKE(fake_sensor_sample_fetch);
 	RESET_FAKE(fake_sensor_channel_get);
 	FFF_RESET_HISTORY();
 

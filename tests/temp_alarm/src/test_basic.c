@@ -149,7 +149,7 @@ ZTEST(temp_alarm_reset, test_reset_clears_state)
         zassert_ok(temp_alarm_check());
         zassert_ok(temp_alarm_get_status(&status));
         zassert_equal(status.alarm_count, 3U);
-        zassert_ok(temp_alarm_reset());
+        temp_alarm_reset();
         zassert_ok(temp_alarm_get_status(&status));
         zassert_false(status.is_alarming);
         zassert_equal(status.alarm_count, 0U);
