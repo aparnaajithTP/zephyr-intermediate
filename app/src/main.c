@@ -1,303 +1,121 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/task_wdt/task_wdt.h>
+#include <zephyr/tracing/tracing.h>
 
-LOG_MODULE_REGISTER(assignment5, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(homework, LOG_LEVEL_INF);
 
-#define STACK_SIZE              1024
+#define STACK_SIZE            2048
+#define CONTROL_PRIORITY         4
+#define MAINTENANCE_PRIORITY     7
+#define EVENT_PERIOD_MS        250
+#define MAINTENANCE_LOAD_US  45000
+#define CONTROL_DEADLINE_MS  10
 
-#define QUEUE_DEPTH             8
-#define SAMPLE_COUNT            30
+static uint32_t deadline_misses;
 
-#define PRODUCER_PERIOD_MS      50
-#define CONSUMER_NORMAL_MS      80
-
-#define HEALTH_PERIOD_MS        100
-#define HEALTH_WARN_PERCENT     75
-
-#define WATCHDOG_TIMEOUT_MS     300
-#define STUCK_SLEEP_MS          1000
-
-struct sensor_msg {
-    uint32_t timestamp_ms;
+struct control_event {
     uint32_t seq;
-    int32_t value;
+    uint32_t ready_ms;
 };
 
-K_MSGQ_DEFINE(sensor_queue,
-              sizeof(struct sensor_msg),
-              QUEUE_DEPTH,
-              4);
+K_MSGQ_DEFINE(control_queue, sizeof(struct control_event), 4, 4);
+K_SEM_DEFINE(maintenance_start, 0, 1);
 
-static int watchdog_channel = -1;
-static bool consumer_stuck;
+/* ================================================================== */
+/*  Timer expiry: creates one control event                           */
+/* ================================================================== */
 
-/*
- * Used so the consumer does not start feeding the watchdog
- * before main() has initialized the task watchdog.
- */
-K_SEM_DEFINE(start_sem, 0, 1);
-
-/* ------------------------------------------------------------------ */
-/* Watchdog callback                                                   */
-/* ------------------------------------------------------------------ */
-
-static void watchdog_callback(int channel_id, void *user_data)
+static void event_timer_expiry(struct k_timer *timer)
 {
-    ARG_UNUSED(user_data);
+    ARG_UNUSED(timer);
 
-    LOG_ERR("[WATCHDOG] CALLBACK TRIGGERED!");
-    LOG_ERR("[WATCHDOG] consumer watchdog channel=%d expired",
-            channel_id);
+    static uint32_t seq;
+    struct control_event event = {
+        .seq = seq++,
+        .ready_ms = k_uptime_get_32(),
+    };
 
-    LOG_ERR("[WATCHDOG] consumer appears stuck");
-}
+    /* Timer expiry runs in interrupt context, so never wait here. */
+    int ret = k_msgq_put(&control_queue, &event, K_NO_WAIT);
 
-/* ------------------------------------------------------------------ */
-/* Producer                                                            */
-/* ------------------------------------------------------------------ */
-
-static void producer_fn(void *p1, void *p2, void *p3)
-{
-    ARG_UNUSED(p1);
-    ARG_UNUSED(p2);
-    ARG_UNUSED(p3);
-
-    k_thread_name_set(k_current_get(), "producer");
-
-    for (uint32_t seq = 0; seq < SAMPLE_COUNT; seq++) {
-
-        struct sensor_msg msg = {
-            .timestamp_ms = k_uptime_get_32(),
-            .seq = seq,
-            .value = 100 + seq,
-        };
-
-        int ret = k_msgq_put(&sensor_queue,
-                             &msg,
-                             K_MSEC(100));
-
-        if (ret == 0) {
-            uint32_t used = k_msgq_num_used_get(&sensor_queue);
-
-            LOG_INF("[PRODUCER] seq=%u q=%u/%u",
-                    msg.seq,
-                    used,
-                    QUEUE_DEPTH);
-        } else {
-            LOG_WRN("[PRODUCER] queue full - dropped seq=%u",
-                    msg.seq);
-        }
-
-        k_msleep(PRODUCER_PERIOD_MS);
-    }
-
-    LOG_INF("[PRODUCER] done");
-}
-
-/* ------------------------------------------------------------------ */
-/* Consumer                                                            */
-/* ------------------------------------------------------------------ */
-
-static void consumer_fn(void *p1, void *p2, void *p3)
-{
-    ARG_UNUSED(p1);
-    ARG_UNUSED(p2);
-    ARG_UNUSED(p3);
-
-    k_thread_name_set(k_current_get(), "consumer");
-
-    /*
-     * Wait until main has initialized the watchdog.
-     */
-    k_sem_take(&start_sem, K_FOREVER);
-
-    watchdog_channel = task_wdt_add(
-        WATCHDOG_TIMEOUT_MS,
-        watchdog_callback,
-        NULL);
-
-    if (watchdog_channel < 0) {
-        LOG_ERR("[CONSUMER] failed to create watchdog channel: %d",
-                watchdog_channel);
+    if (ret != 0) {
         return;
     }
 
-    LOG_INF("[CONSUMER] watchdog channel=%d timeout=%dms",
-            watchdog_channel,
-            WATCHDOG_TIMEOUT_MS);
+    /* Both threads become ready when the timer interrupt returns. */
+    k_sem_give(&maintenance_start);
 
-    for (uint32_t i = 0; i < SAMPLE_COUNT; i++) {
+    sys_trace_named_event("control_ready", event.seq, event.ready_ms);
+}
 
-        struct sensor_msg msg;
+K_TIMER_DEFINE(event_timer, event_timer_expiry, NULL);
 
-        int ret = k_msgq_get(&sensor_queue,
-                             &msg,
-                             K_MSEC(500));
+/* ================================================================== */
+/*  Control thread                                                   */
+/* ================================================================== */
+
+static void control_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    while (true) {
+        struct control_event event;
+        int ret = k_msgq_get(&control_queue, &event, K_FOREVER);
 
         if (ret != 0) {
-            LOG_WRN("[CONSUMER] queue receive timeout");
-            task_wdt_feed(watchdog_channel);
+            LOG_ERR("[CONTROL] receive failed: %d", ret);
             continue;
         }
 
-        uint32_t used = k_msgq_num_used_get(&sensor_queue);
+        LOG_INF("[CONTROL] processed seq=%u", event.seq);
 
-        LOG_INF("[CONSUMER] seq=%u q=%u/%u",
-                msg.seq,
-                used,
-                QUEUE_DEPTH);
+        uint32_t now_ms = k_uptime_get_32();
+        uint32_t latency_ms = now_ms - event.ready_ms;
 
-        /*
-         * Deliberately simulate a stuck consumer once.
-         */
-        if (i == 4 && !consumer_stuck) {
+        LOG_INF("[CONTROL] processed seq=%u latency=%u ms",
+                event.seq, latency_ms);
 
-            consumer_stuck = true;
+        if (latency_ms > CONTROL_DEADLINE_MS) {
+            deadline_misses++;
 
-            LOG_WRN("[CONSUMER] *** SIMULATING STUCK CONSUMER ***");
-            LOG_WRN("[CONSUMER] sleeping for %dms",
-                    STUCK_SLEEP_MS);
-            LOG_WRN("[CONSUMER] watchdog timeout is only %dms",
-                    WATCHDOG_TIMEOUT_MS);
-
-            /*
-             * Deliberately do NOT feed the watchdog here.
-             */
-            k_msleep(STUCK_SLEEP_MS);
-
-            LOG_WRN("[CONSUMER] recovered from simulated stall");
-        }
-
-        /*
-         * Normal operation.
-         */
-        if (watchdog_channel >= 0) {
-            ret = task_wdt_feed(watchdog_channel);
-
-            if (ret != 0) {
-                LOG_WRN("[CONSUMER] watchdog feed failed: %d",
-                        ret);
+            LOG_WRN_RATELIMIT(
+                "[DEADLINE] seq=%u latency=%u ms > %u ms (misses=%u)",
+                event.seq, latency_ms, CONTROL_DEADLINE_MS, deadline_misses);
             }
-        }
 
-        k_msleep(CONSUMER_NORMAL_MS);
-    }
-
-    LOG_INF("[CONSUMER] done");
-
-    if (watchdog_channel >= 0) {
-        task_wdt_delete(watchdog_channel);
+        sys_trace_named_event("control_complete", event.seq, latency_ms);
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Health monitor                                                      */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  Background maintenance thread                                    */
+/* ================================================================== */
 
-static void health_fn(void *p1, void *p2, void *p3)
+static void maintenance_fn(void *p1, void *p2, void *p3)
 {
-    ARG_UNUSED(p1);
-    ARG_UNUSED(p2);
-    ARG_UNUSED(p3);
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-    k_thread_name_set(k_current_get(), "health");
+    while (true) {
+        k_sem_take(&maintenance_start, K_FOREVER);
 
-    for (int i = 0; i < 25; i++) {
-
-        k_msleep(HEALTH_PERIOD_MS);
-
-        uint32_t used = k_msgq_num_used_get(&sensor_queue);
-
-        uint32_t percent =
-            (used * 100U) / QUEUE_DEPTH;
-
-        LOG_INF("[HEALTH] queue=%u/%u (%u%%)",
-                used,
-                QUEUE_DEPTH,
-                percent);
-
-        if (percent >= HEALTH_WARN_PERCENT) {
-
-            LOG_WRN("[HEALTH] WARNING: queue at %u%% capacity",
-                    percent);
-        }
+        /* This work is important, but it has no short deadline. */
+        k_busy_wait(MAINTENANCE_LOAD_US);
     }
-
-    LOG_INF("[HEALTH] monitoring complete");
 }
 
-/* ------------------------------------------------------------------ */
-/* Thread definitions                                                  */
-/* ------------------------------------------------------------------ */
+K_THREAD_DEFINE(control, STACK_SIZE, control_fn,
+                NULL, NULL, NULL, CONTROL_PRIORITY, 0, 0);
 
-K_THREAD_DEFINE(producer_thread,
-                STACK_SIZE,
-                producer_fn,
-                NULL, NULL, NULL,
-                5,
-                0,
-                0);
-
-K_THREAD_DEFINE(consumer_thread,
-                STACK_SIZE,
-                consumer_fn,
-                NULL, NULL, NULL,
-                5,
-                0,
-                0);
-
-K_THREAD_DEFINE(health_thread,
-                STACK_SIZE,
-                health_fn,
-                NULL, NULL, NULL,
-                6,
-                0,
-                0);
-
-/* ------------------------------------------------------------------ */
-/* Main                                                                */
-/* ------------------------------------------------------------------ */
+K_THREAD_DEFINE(maintenance, STACK_SIZE, maintenance_fn,
+                NULL, NULL, NULL, MAINTENANCE_PRIORITY, 0, 0);
 
 int main(void)
 {
-    LOG_INF("=== L5 Assignment: Reliability Under Pressure ===");
+    LOG_INF("=== L6 Homework: Runtime Investigation ===");
+    LOG_INF("Control work must start within 10 ms");
+    LOG_INF("Inspect, measure, trace, explain, and correct the delay");
 
-    LOG_INF("queue depth=%d", QUEUE_DEPTH);
-    LOG_INF("producer period=%dms", PRODUCER_PERIOD_MS);
-    LOG_INF("consumer normal delay=%dms", CONSUMER_NORMAL_MS);
-    LOG_INF("watchdog timeout=%dms", WATCHDOG_TIMEOUT_MS);
-    LOG_INF("stuck consumer sleep=%dms", STUCK_SLEEP_MS);
-    LOG_INF("health warning threshold=%d%%",
-            HEALTH_WARN_PERCENT);
-
-    /*
-     * Initialize the task watchdog before releasing
-     * the consumer.
-     */
-    int ret = task_wdt_init(NULL);
-
-    if (ret != 0) {
-        LOG_ERR("[WATCHDOG] init failed: %d", ret);
-        return 0;
-    }
-
-    LOG_INF("[WATCHDOG] task watchdog initialized");
-
-    /*
-     * Allow consumer to create its watchdog channel.
-     */
-    k_sem_give(&start_sem);
-
-    /*
-     * Allow enough time for:
-     * - producer to finish
-     * - consumer to hit the intentional stall
-     * - health monitor to report queue buildup
-     */
-    k_msleep(5000);
-
-    LOG_INF("=== L5 Assignment complete ===");
+    k_timer_start(&event_timer, K_MSEC(500), K_MSEC(EVENT_PERIOD_MS));
 
     return 0;
 }
